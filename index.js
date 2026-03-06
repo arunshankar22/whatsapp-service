@@ -41,7 +41,7 @@ async function connectToWhatsApp() {
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             console.log('Connection closed. Reconnect:', shouldReconnect);
-            
+
             isConnected = false;
             connectionStatus = 'disconnected';
             qrCodeData = null;
@@ -69,6 +69,18 @@ app.post('/initialize', async (req, res) => {
 
         qrCodeData = null;
         connectionStatus = 'initializing';
+
+        // Close existing socket if any to start fresh
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners();
+                sock.end();
+            } catch (e) {
+                console.log('Cleanup of old socket:', e.message);
+            }
+            sock = null;
+        }
+
         await connectToWhatsApp();
 
         // Wait for QR code generation (max 10 seconds)
@@ -83,7 +95,44 @@ app.post('/initialize', async (req, res) => {
         } else if (qrCodeData) {
             res.json({ success: true, message: 'QR code generated', status: 'qr_ready' });
         } else {
-            res.status(500).json({ success: false, message: 'Failed to generate QR code' });
+            // Stale auth is likely blocking QR generation - clear it and retry
+            console.log('QR generation failed with existing auth. Clearing auth and retrying fresh...');
+
+            if (sock) {
+                try {
+                    sock.ev.removeAllListeners();
+                    sock.end();
+                } catch (e) { }
+                sock = null;
+            }
+
+            // Clear stale auth
+            if (fs.existsSync(authDir)) {
+                fs.rmSync(authDir, { recursive: true, force: true });
+                console.log('Cleared stale auth_info directory');
+            }
+
+            isConnected = false;
+            connectionStatus = 'initializing';
+            qrCodeData = null;
+
+            // Retry with clean state
+            await connectToWhatsApp();
+
+            // Wait for QR code (max 15 seconds for fresh connection)
+            let retryAttempts = 0;
+            while (!qrCodeData && retryAttempts < 30 && connectionStatus !== 'connected') {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                retryAttempts++;
+            }
+
+            if (isConnected) {
+                res.json({ success: true, message: 'Connected after auth reset', status: 'connected' });
+            } else if (qrCodeData) {
+                res.json({ success: true, message: 'QR code generated after auth reset', status: 'qr_ready' });
+            } else {
+                res.status(500).json({ success: false, message: 'Failed to generate QR code. Please try again.' });
+            }
         }
     } catch (error) {
         console.error('Initialize error:', error);
@@ -136,15 +185,15 @@ app.get('/groups', async (req, res) => {
 function formatPhoneNumber(number) {
     // Remove all non-numeric characters
     let cleaned = number.replace(/\D/g, '');
-    
+
     // If starts with 00, replace with +
     if (cleaned.startsWith('00')) {
         cleaned = cleaned.substring(2);
     }
-    
+
     // Remove leading + if present
     cleaned = cleaned.replace(/^\+/, '');
-    
+
     return cleaned + '@s.whatsapp.net';
 }
 
@@ -168,7 +217,7 @@ app.post('/publish', async (req, res) => {
             for (const recipient of recipients) {
                 try {
                     const formattedNumber = formatPhoneNumber(recipient);
-                    
+
                     if (mediaUrl) {
                         // Send media with caption
                         await sock.sendMessage(formattedNumber, {
@@ -179,7 +228,7 @@ app.post('/publish', async (req, res) => {
                         // Send text only
                         await sock.sendMessage(formattedNumber, { text: caption });
                     }
-                    
+
                     results.push({ recipient, success: true });
                 } catch (error) {
                     console.error(`Error sending to ${recipient}:`, error);
@@ -225,12 +274,12 @@ app.post('/logout', async (req, res) => {
         if (sock) {
             await sock.logout();
         }
-        
+
         // Delete auth files
         if (fs.existsSync(authDir)) {
             fs.rmSync(authDir, { recursive: true, force: true });
         }
-        
+
         isConnected = false;
         connectionStatus = 'disconnected';
         qrCodeData = null;
@@ -248,8 +297,18 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`WhatsApp service running on port ${PORT}`);
 });
 
-// Auto-connect if auth exists
+// Check if auth exists on startup - only auto-connect if auth files look valid
 if (fs.existsSync(authDir)) {
-    console.log('Auth found, auto-connecting...');
-    connectToWhatsApp();
+    const authFiles = fs.readdirSync(authDir);
+    const hasCredsFile = authFiles.some(f => f.includes('creds'));
+    if (hasCredsFile) {
+        console.log('Auth found, attempting auto-connect...');
+        connectToWhatsApp().catch(err => {
+            console.log('Auto-connect failed (stale auth?), will retry on /initialize:', err.message);
+        });
+    } else {
+        console.log('Auth directory exists but no creds file - waiting for /initialize');
+    }
+} else {
+    console.log('No auth found - waiting for /initialize');
 }
